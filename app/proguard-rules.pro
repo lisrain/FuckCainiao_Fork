@@ -1,1 +1,1 @@
--keep class io.github.duzhaokun123.fuckcainiao.XposedInit
+-keep class io.github.lisrain.fuckcainiao.XposedInit

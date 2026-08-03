@@ -1,4 +1,4 @@
-package io.github.duzhaokun123.fuckcainiao
+package io.github.lisrain.fuckcainiao
 
 import android.app.Activity
 import android.content.Context

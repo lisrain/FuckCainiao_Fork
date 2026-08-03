@@ -3,16 +3,16 @@ plugins {
 }
 
 android {
-    namespace = "io.github.duzhaokun123.fuckcainiao"
+    namespace = "io.github.lisrain.fuckcainiao"
     compileSdk = 37
     buildToolsVersion = "37.0.0"
 
     defaultConfig {
-        applicationId = "io.github.duzhaokun123.fuckcainiao"
+        applicationId = "io.github.lisrain.fuckcainiao"
         minSdk = 26
         targetSdk = 37
-        versionCode = 9
-        versionName = "0.2.1"
+        versionCode = 10
+        versionName = "0.3.1"
     }
 
     buildTypes {

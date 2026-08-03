@@ -1,4 +1,4 @@
-package io.github.duzhaokun123.fuckcainiao
+package io.github.lisrain.fuckcainiao
 
 import android.app.Activity
 import android.content.Intent
@@ -14,8 +14,6 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import io.github.libxposed.api.XposedModule
-import io.github.libxposed.api.XposedModuleInterface.HotReloadedParam
-import io.github.libxposed.api.XposedModuleInterface.HotReloadingParam
 import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
@@ -42,17 +40,6 @@ class XposedInit : XposedModule() {
         if (param.packageName != TARGET_PACKAGE) return
         log(Log.INFO, TAG, "onPackageReady: ${param.packageName}")
         installHooks(param.classLoader)
-    }
-
-    override fun onHotReloading(param: HotReloadingParam): Boolean {
-        log(Log.INFO, TAG, "onHotReloading")
-        return true
-    }
-
-    override fun onHotReloaded(param: HotReloadedParam) {
-        // onHotReloaded 拿不到目标包的 classloader，无法重新安装 hook，
-        // 因此保留旧 hook 继续生效（默认行为是卸载全部旧 hook），新代码在进程重启后应用。
-        log(Log.INFO, TAG, "onHotReloaded: ${param.processName}, keep ${param.oldHookHandles.size} old hooks")
     }
 
     private fun installHooks(classLoader: ClassLoader) {
