@@ -1,15 +1,16 @@
 plugins {
-    alias(libs.plugins.androidApplication)
+    alias(libs.plugins.agp.app)
 }
 
 android {
     namespace = "io.github.duzhaokun123.fuckcainiao"
-    compileSdk = 36
+    compileSdk = 37
+    buildToolsVersion = "37.0.0"
 
     defaultConfig {
         applicationId = "io.github.duzhaokun123.fuckcainiao"
-        minSdk = 24
-        targetSdk = 36
+        minSdk = 26
+        targetSdk = 37
         versionCode = 9
         versionName = "0.2.1"
     }
@@ -29,18 +30,23 @@ android {
         buildConfig = true
     }
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
     }
-    packaging.resources.excludes.add("**")
-}
-
-kotlin {
-    jvmToolchain(11)
+    packaging {
+        resources {
+            merges += "META-INF/xposed/*"
+            excludes += "**"
+        }
+    }
+    lint {
+        abortOnError = true
+        checkReleaseBuilds = false
+    }
 }
 
 dependencies {
-    compileOnly(libs.xposed.api)
-    implementation(libs.ezXHelper)
-
+    compileOnly(libs.libxposed.api)
+    compileOnly("androidx.annotation:annotation:1.9.1")
+    implementation(libs.libxposed.service)
 }

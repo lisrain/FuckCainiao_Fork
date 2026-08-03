@@ -1,9 +1,9 @@
 # FuckCainiao
 
 [![GitHub license](https://img.shields.io/github/license/duzhaokun123/FuckCainiao?style=flat-square)](https://github.com/duzhaokun123/FuckCainiao/blob/main/LICENSE)
-![Android SDK min 24](https://img.shields.io/badge/Android%20SDK-%3E%3D%2024-brightgreen?style=flat-square&logo=android)
-![Android SDK target 33](https://img.shields.io/badge/Android%20SDK-target%2033-brightgreen?style=flat-square&logo=android)
-![Xposed Module](https://img.shields.io/badge/Xposed-Module-blue?style=flat-square)
+![Android SDK min 26](https://img.shields.io/badge/Android%20SDK-%3E%3D%2026-brightgreen?style=flat-square&logo=android)
+![Android SDK target 37](https://img.shields.io/badge/Android%20SDK-target%2037-brightgreen?style=flat-square&logo=android)
+![libxposed API 102](https://img.shields.io/badge/libxposed-API%20102-blue?style=flat-square)
 
 菜鸟界面优化和广告移除
 
@@ -30,6 +30,4 @@ https://github.com/Xposed-Modules-Repo/io.github.duzhaokun123.fuckcainiao
 
 [AOSP](https://source.android.com/)
 
-[EzXHelper](https://github.com/KyuubiRan/EzXHelper)
-
-[xposed](https://forum.xda-developers.com/xposed)
+[libxposed](https://github.com/libxposed/api)

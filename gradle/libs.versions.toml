@@ -1,15 +1,12 @@
 [versions]
-agp = "9.0.0"
-xposed-api = "82"
-#noinspection NewerVersionAvailable
-ezXHelper = "1.0.3"
-
-[libraries]
-xposed-api = { module = "de.robv.android.xposed:api", version.ref = "xposed-api" }
-ezXHelper = { module = "com.github.kyuubiran:EzXHelper", version.ref = "ezXHelper" }
+agp = "9.2.1"
+xposed-api = "102.0.0"
+xposed-service = "102.0.0"
 
 [plugins]
-androidApplication = { id = "com.android.application", version.ref = "agp" }
+agp-app = { id = "com.android.application", version.ref = "agp" }
 
-[bundles]
+[libraries]
+libxposed-api = { group = "io.github.libxposed", name = "api", version.ref = "xposed-api" }
+libxposed-service = { group = "io.github.libxposed", name = "service", version.ref = "xposed-service" }
 
