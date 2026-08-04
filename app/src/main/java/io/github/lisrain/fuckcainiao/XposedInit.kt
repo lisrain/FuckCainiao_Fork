@@ -25,6 +25,51 @@ class XposedInit : XposedModule() {
         const val TARGET_PACKAGE = "com.cainiao.wireless"
         const val HOME_PAGE_ACTIVITY = "com.cainiao.wireless.homepage.view.activity.HomePageActivity"
         const val TARGET_WUHUANWU = "物换物"
+
+        private val PROFILE_CLEAN_JS = """
+(function(){
+  if (window.__fcClean) return;
+  window.__fcClean = 1;
+  var container = null;
+  function findContainer(){
+    if (container && container.isConnected) return container;
+    container = null;
+    var divs = document.querySelectorAll('div');
+    for (var i = 0; i < divs.length; i++) {
+      var el = divs[i];
+      if (el.childElementCount === 0 && (el.textContent || '').trim() === '我的订单') {
+        var card = el.parentElement;
+        if (card && card.parentElement) { container = card.parentElement; return container; }
+      }
+    }
+    return null;
+  }
+  function clean(){
+    var c = findContainer();
+    if (!c) return;
+    var order = null;
+    for (var i = 0; i < c.children.length; i++) {
+      if ((c.children[i].textContent || '').indexOf('我的订单') >= 0) { order = c.children[i]; break; }
+    }
+    if (!order) return;
+    var n = order.nextElementSibling;
+    while (n) {
+      var next = n.nextElementSibling;
+      c.removeChild(n);
+      n = next;
+    }
+  }
+  var scheduled = false;
+  function schedule(){
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(function(){ scheduled = false; clean(); });
+  }
+  new MutationObserver(schedule).observe(document.documentElement, {childList: true, subtree: true});
+  setInterval(clean, 2000);
+  clean();
+})();
+        """.trimIndent()
     }
 
     override fun onModuleLoaded(param: ModuleLoadedParam) {
@@ -55,6 +100,10 @@ class XposedInit : XposedModule() {
         hookDXRecyclerViewAdapter(classLoader)
         hookAboutFuckCainiaoIntent()
         hookLogisticDetailTANXBannerView(classLoader)
+        hookLogisticNoticeProtocolView(classLoader)
+        hookLogisticVipBannerView(classLoader)
+        hookGuoJiangPop(classLoader)
+        hookProfileH5Cleaner(classLoader)
         hookGuideAdsSection(classLoader)
         hookPackageListSection(classLoader)
         hookNavigationViewStripRefresh(classLoader)
@@ -494,6 +543,101 @@ class XposedInit : XposedModule() {
                 chain.proceed(arrayOfNulls(1))
             }
         }.onFailure { log(Log.ERROR, TAG, "hookLogisticDetailTANXBannerView failed", it) }
+    }
+
+    /**
+     * 快递详情页头部的活动推广/通知横幅(LogisticNoticeProtocolView，根视图 R.id.rootLayout)。
+     * setData 收到 null 时会自行 setVisibility(GONE)，故把模板参数置空即可隐藏横幅。
+     */
+    private fun hookLogisticNoticeProtocolView(classLoader: ClassLoader) {
+        runCatching {
+            val modelClass = Class.forName("com.taobao.cainiao.logistic.js.entity.page.LogisticMtopTemplateModel", false, classLoader)
+            val clazz = Class.forName("com.taobao.cainiao.logistic.component.header.LogisticNoticeProtocolView", false, classLoader)
+            val method = clazz.findMethod { it.parameterCount == 1 && it.parameterTypes[0] == modelClass } ?: return
+            hook(method).intercept { chain ->
+                Log.d(TAG, "LogisticNoticeProtocolView setData hook")
+                chain.proceed(arrayOfNulls(1))
+            }
+        }.onFailure { log(Log.ERROR, TAG, "hookLogisticNoticeProtocolView failed", it) }
+    }
+
+    /**
+     * 快递详情页"会员福利"活动推广横幅(LogisticVipBannerView，根视图 R.id.rootLayout)。
+     * setData 解析 model 为 null 时会自行 setVisibility(GONE)，故把模板参数置空即可隐藏。
+     */
+    private fun hookLogisticVipBannerView(classLoader: ClassLoader) {
+        runCatching {
+            val modelClass = Class.forName("com.taobao.cainiao.logistic.js.entity.page.LogisticMtopTemplateModel", false, classLoader)
+            val clazz = Class.forName("com.taobao.cainiao.logistic.ui.view.protocol_component.LogisticVipBannerView", false, classLoader)
+            val method = clazz.findMethod { it.parameterCount == 1 && it.parameterTypes[0] == modelClass } ?: return
+            hook(method).intercept { chain ->
+                Log.d(TAG, "LogisticVipBannerView setData hook")
+                chain.proceed(arrayOfNulls(1))
+            }
+        }.onFailure { log(Log.ERROR, TAG, "hookLogisticVipBannerView failed", it) }
+    }
+
+    /**
+     * 拦截"新人送裹酱"等裹酱任务推广弹层：
+     * 1. TaskGuideManager.onEvent 是 ACCS 推送入口，直接阻断不再解析展示；
+     * 2. GuoJiangChainManager.a/b 是快递详情页裹酱动画弹窗的展示入口，兜底置空。
+     */
+    private fun hookGuoJiangPop(classLoader: ClassLoader) {
+        runCatching {
+            val clazz = Class.forName("com.cainiao.wireless.shop.task.guide.TaskGuideManager", false, classLoader)
+            val method = clazz.findMethod { it.name == "onEvent" && it.parameterCount == 1 } ?: return
+            hook(method).intercept {
+                Log.d(TAG, "TaskGuideManager onEvent hook, block guojiang pop")
+                null
+            }
+        }.onFailure { log(Log.ERROR, TAG, "hookTaskGuideManager failed", it) }
+        runCatching {
+            val clazz = Class.forName("com.cainiao.wireless.shop.task.guide.chain.GuoJiangChainManager", false, classLoader)
+            clazz.findAllMethods {
+                (it.name == "a" || it.name == "b") && it.parameterCount == 2 && it.parameterTypes[0] == Activity::class.java
+            }.forEach { method ->
+                hook(method).intercept {
+                    Log.d(TAG, "GuoJiangChainManager ${method.name} hook, block guojiang dialog")
+                    null
+                }
+            }
+        }.onFailure { log(Log.ERROR, TAG, "hookGuoJiangChainManager failed", it) }
+    }
+
+    /**
+     * "我的"页是 H5(page.cainiao.com/cn-app-web/profile)，向 WebView 注入清理脚本：
+     * 移除"热门活动"卡片(标题文本锚点)和底部轮播推广横幅(热门活动后的最后一张白色圆角卡片)。
+     */
+    private fun hookProfileH5Cleaner(classLoader: ClassLoader) {
+        runCatching {
+            val clazz = Class.forName("android.taobao.windvane.extra.uc.WVUCWebView", false, classLoader)
+            val method = clazz.findMethod { it.name == "loadUrl" && it.parameterCount == 1 && it.parameterTypes[0] == String::class.java }
+                ?: return
+            hook(method).intercept { chain ->
+                val result = chain.proceed()
+                val url = chain.getArg(0) as? String
+                if (url != null && url.contains("cn-app-web/profile")) {
+                    val webView = chain.thisObject
+                    val handler = Handler(Looper.getMainLooper())
+                    for (delay in longArrayOf(0L, 300L, 800L, 1500L, 3000L)) {
+                        handler.postDelayed({
+                            runCatching {
+                                webView.invokeEvaluateJs(PROFILE_CLEAN_JS)
+                            }.onFailure { log(Log.ERROR, TAG, "profile clean js failed", it) }
+                        }, delay)
+                    }
+                }
+                result
+            }
+        }.onFailure { log(Log.ERROR, TAG, "hookProfileH5Cleaner failed", it) }
+    }
+
+    private fun Any.invokeEvaluateJs(js: String) {
+        val method = javaClass.methods.firstOrNull {
+            it.name == "evaluateJavascript" && it.parameterCount == 2 && it.parameterTypes[0] == String::class.java
+        } ?: return
+        method.isAccessible = true
+        method.invoke(this, js, null)
     }
 
     private fun hookGuideAdsSection(classLoader: ClassLoader) {
