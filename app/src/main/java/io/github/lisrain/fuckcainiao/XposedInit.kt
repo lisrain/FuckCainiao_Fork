@@ -1,6 +1,7 @@
 package io.github.lisrain.fuckcainiao
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
@@ -17,6 +18,10 @@ import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
+import java.io.File
+import java.lang.reflect.Method
+import java.util.WeakHashMap
+import java.util.concurrent.ConcurrentHashMap
 
 class XposedInit : XposedModule() {
     companion object {
@@ -26,13 +31,39 @@ class XposedInit : XposedModule() {
         const val HOME_PAGE_ACTIVITY = "com.cainiao.wireless.homepage.view.activity.HomePageActivity"
         const val TARGET_WUHUANWU = "物换物"
 
+        /** 应用内升级提示弹窗（"更新安装包已经下载好"）。 */
+        private const val TARGET_UPDATE_KEYWORD = "更新安装包"
+        private const val UPDATE_TITLE_STRING = "guoguo_download_done_notify_install"
+        private const val UPDATE_TITLE_ID = "gg_head_img_dialog_title"
+        private const val POPUP_TYPE_APPUPDATE = "APPUPDATE"
+
+        /** 更新检查的网络层实现（唯一实现类，未混淆）与下载落盘位置。 */
+        private const val APP_VERSION_API_IMPL = "com.cainiao.wireless.mvp.model.impl.mtop.AppVersionAPIAtlasImpl"
+        private const val APK_UPDATE_TASK = "com.cainiao.wireless.components.update.ApkUpdateTask"
+        private const val APK_DOWNLOAD_LISTENER = "com.cainiao.wireless.components.update.ApkUpdateTask\$ApkDownloadListener"
+        private const val UPDATE_APK_DIR = "update"
+        private const val UPDATE_APK_NAME = "cainiao4android_tmp.apk"
+
+        private const val PROFILE_URL_MARKER = "cn-app-web/profile"
+        private val PROFILE_HANDLER = Handler(Looper.getMainLooper())
+        private val PROFILE_LOAD_RETRY_DELAYS = longArrayOf(0L, 16L, 64L, 160L, 400L, 900L)
+        private val PROFILE_START_RETRY_DELAYS = longArrayOf(0L, 16L, 64L, 160L)
+
         private val PROFILE_CLEAN_JS = """
 (function(){
-  if (window.__fcClean) return;
-  window.__fcClean = 1;
+  var old = window.__fcClean;
+  if (String(location.href || '').indexOf('cn-app-web/profile') === -1) return;
+  if (old && old.version === 2) {
+    old.start();
+    old.clean();
+    return;
+  }
   var container = null;
+  var observer = null;
+  var started = false;
+  var cleaning = false;
   function findContainer(){
-    if (container && container.isConnected) return container;
+    if (container && document.documentElement && document.documentElement.contains(container)) return container;
     container = null;
     var divs = document.querySelectorAll('div');
     for (var i = 0; i < divs.length; i++) {
@@ -45,32 +76,46 @@ class XposedInit : XposedModule() {
     return null;
   }
   function clean(){
-    var c = findContainer();
-    if (!c) return;
-    var order = null;
-    for (var i = 0; i < c.children.length; i++) {
-      if ((c.children[i].textContent || '').indexOf('我的订单') >= 0) { order = c.children[i]; break; }
-    }
-    if (!order) return;
-    var n = order.nextElementSibling;
-    while (n) {
-      var next = n.nextElementSibling;
-      c.removeChild(n);
-      n = next;
+    if (cleaning) return;
+    cleaning = true;
+    try {
+      var c = findContainer();
+      if (!c) return;
+      var order = null;
+      for (var i = 0; i < c.children.length; i++) {
+        if ((c.children[i].textContent || '').indexOf('我的订单') >= 0) { order = c.children[i]; break; }
+      }
+      if (!order) return;
+      var n = order.nextElementSibling;
+      while (n) {
+        var next = n.nextElementSibling;
+        c.removeChild(n);
+        n = next;
+      }
+    } finally {
+      cleaning = false;
     }
   }
-  var scheduled = false;
-  function schedule(){
-    if (scheduled) return;
-    scheduled = true;
-    requestAnimationFrame(function(){ scheduled = false; clean(); });
+  function start(){
+    if (started) { clean(); return; }
+    var root = document.documentElement;
+    if (!root) { setTimeout(start, 0); return; }
+    started = true;
+    observer = new MutationObserver(clean);
+    observer.observe(root, {childList: true, subtree: true});
+    clean();
   }
-  new MutationObserver(schedule).observe(document.documentElement, {childList: true, subtree: true});
-  setInterval(clean, 2000);
-  clean();
+  window.__fcClean = {version: 2, start: start, clean: clean};
+  start();
 })();
         """.trimIndent()
     }
+
+    private val profileWebViews = WeakHashMap<Any, Boolean>()
+    private val evaluateJavascriptMethods = ConcurrentHashMap<Class<*>, Method>()
+    private val getUrlMethods = ConcurrentHashMap<Class<*>, Method>()
+    private val injectJsEarlyMethods = ConcurrentHashMap<Class<*>, Method>()
+    private val earlyInjectedProfileWebViews = WeakHashMap<Any, Boolean>()
 
     override fun onModuleLoaded(param: ModuleLoadedParam) {
         log(Log.INFO, TAG, "onModuleLoaded: ${param.processName}")
@@ -89,6 +134,7 @@ class XposedInit : XposedModule() {
 
     private fun installHooks(classLoader: ClassLoader) {
         hookHomePageActivity(classLoader)
+        hookNavigationTabsRebuild(classLoader)
         hookCubeXLinearLayoutFragment(classLoader)
         hookLogisticDetailBannerView(classLoader)
         hookWelcomeActivity(classLoader)
@@ -103,6 +149,9 @@ class XposedInit : XposedModule() {
         hookLogisticNoticeProtocolView(classLoader)
         hookLogisticVipBannerView(classLoader)
         hookGuoJiangPop(classLoader)
+        hookUpdateInstallDialog(classLoader)
+        hookAppUpdateCheck(classLoader)
+        hookApkDownloadTask(classLoader)
         hookProfileH5Cleaner(classLoader)
         hookGuideAdsSection(classLoader)
         hookPackageListSection(classLoader)
@@ -139,19 +188,44 @@ class XposedInit : XposedModule() {
             hook(method).intercept { chain ->
                 val result = chain.proceed()
                 val activity = chain.thisObject as Activity
-                val layoutId = activity.resources.getIdentifier("ll_navigation_tab_layout", "id", activity.packageName)
-                if (layoutId != 0) {
-                    activity.findViewById<LinearLayout>(layoutId)?.apply {
-                        // 保留首尾两个 tab(首页、我的)，隐藏中间的 tab/广告
-                        for (i in 1 until childCount - 1) {
-                            getChildAt(i)?.visibility = View.GONE
-                        }
-                    }
-                }
+                activity.window?.decorView?.let { hideMiddleTabs(it) }
                 syncNavigationBarColor(activity)
+                purgeDownloadedUpdatePackage(activity)
                 result
             }
         }.onFailure { log(Log.ERROR, TAG, "hookHomePageActivity failed", it) }
+    }
+
+    /**
+     * 隐藏底栏中间 tab(保留首尾两个:首页、我的)，供初始渲染和重建时共用。
+     */
+    private fun hideMiddleTabs(root: View) {
+        val layoutId = root.resources.getIdentifier("ll_navigation_tab_layout", "id", root.context.packageName)
+        if (layoutId == 0) return
+        val layout = root.findViewById<View>(layoutId) as? LinearLayout ?: return
+        for (i in 1 until layout.childCount - 1) {
+            layout.getChildAt(i)?.visibility = View.GONE
+        }
+    }
+
+    /**
+     * 底栏 tab 的每一次重建(登录成功 refreshNavigations、配置推送、灰度切换等)都会
+     * 经 renderNavigationTabs 做 removeAllViews + 重新 addView，此前设置的 GONE 会全部丢失。
+     * 这里在重建完成后重新隐藏中间 tab，覆盖首次安装登录后 hook 失效的问题。
+     */
+    private fun hookNavigationTabsRebuild(classLoader: ClassLoader) {
+        runCatching {
+            val clazz = Class.forName("com.cainiao.commonlibrary.navigation.NavigationView", false, classLoader)
+            val method = clazz.findMethod { it.name == "renderNavigationTabs" && it.parameterCount == 1 } ?: return
+            hook(method).intercept { chain ->
+                val result = chain.proceed()
+                runCatching {
+                    val navView = chain.thisObject as? View ?: return@runCatching
+                    hideMiddleTabs(navView)
+                }.onFailure { log(Log.ERROR, TAG, "hideMiddleTabs after rebuild failed", it) }
+                result
+            }
+        }.onFailure { log(Log.ERROR, TAG, "hookNavigationTabsRebuild failed", it) }
     }
 
     /**
@@ -605,39 +679,381 @@ class XposedInit : XposedModule() {
     }
 
     /**
+     * 拦截应用内升级提示弹窗「更新安装包已经下载好 / 优化更多细节…」。
+     *
+     * 8.11.727 的链路：
+     *  ApkUpdateTask 下载完成 → components.update.a.e(bool,bool) → postTask(a$2)
+     *  → new kw(ctx).kf(标题).kg(正文).a(取消).b(确定) → kp.Hj()
+     *  → new GuoguoCommonDialog(ctx) + setContentView(GGTextDialogContentView) → show()
+     *
+     * kw / kp / a$2 全是混淆名（R8 每版重排），不能写死；而 GuoguoCommonDialog 是
+     * commonlibrary 里未混淆的公共弹窗类，show() 也是未混淆的 public 方法，
+     * 所有 Guoguo 弹窗都汇聚到这里，所以在 show() 处按标题文本 + PopupType 拦截。
+     */
+    private fun hookUpdateInstallDialog(classLoader: ClassLoader) {
+        runCatching {
+            val clazz = Class.forName("com.cainiao.commonlibrary.popupui.dialog.GuoguoCommonDialog", false, classLoader)
+            val method = clazz.findMethod { it.name == "show" && it.parameterCount == 0 } ?: run {
+                log(Log.WARN, TAG, "GuoguoCommonDialog.show 未找到，升级弹窗拦截跳过")
+                return
+            }
+            hook(method).intercept { chain ->
+                val dialog = chain.thisObject
+                val blocked = runCatching { isUpdateInstallDialog(dialog) }
+                    .onFailure { log(Log.ERROR, TAG, "isUpdateInstallDialog failed", it) }
+                    .getOrDefault(false)
+                if (blocked) {
+                    log(Log.INFO, TAG, "拦截更新安装包弹窗")
+                    return@intercept null
+                }
+                chain.proceed()
+            }
+        }.onFailure { log(Log.ERROR, TAG, "hookUpdateInstallDialog failed", it) }
+    }
+
+    /**
+     * 读取 Guoguo 弹窗内容区的标题文案；内容区不是 GGText 系或标题未渲染时返回 null。
+     */
+    private fun readDialogTitle(dialog: Any): String? {
+        val contentView = dialog.invokeMethod("Hq") as? View ?: return null
+        val titleViewId = contentView.resources.getIdentifier(
+            UPDATE_TITLE_ID, "id", contentView.context.packageName
+        )
+        if (titleViewId == 0) return null
+        return (contentView.findViewById<View>(titleViewId) as? TextView)?.text?.toString()
+    }
+
+    /**
+     * 判定当前 Guoguo 弹窗是否为升级提示：
+     * 1. 走 popupmanager 队列时会被显式标记 PopupType.APPUPDATE；
+     * 2. 直接 show 的路径没有标记，此时读内容区标题文案，与资源
+     *    guoguo_download_done_notify_install 比对（资源名变了再退回关键词）。
+     */
+    private fun isUpdateInstallDialog(dialog: Any): Boolean {
+        val popupType = dialog.invokeMethod("obtainType")
+        if (popupType?.toString() == POPUP_TYPE_APPUPDATE) return true
+
+        val contentView = dialog.invokeMethod("Hq") as? View ?: return false
+        val res = contentView.resources
+        val pkg = contentView.context.packageName
+
+        val titleViewId = res.getIdentifier(UPDATE_TITLE_ID, "id", pkg)
+        if (titleViewId == 0) return false
+        val title = (contentView.findViewById<View>(titleViewId) as? TextView)?.text?.toString()
+        if (title.isNullOrBlank()) return false
+
+        val declared = res.getIdentifier(UPDATE_TITLE_STRING, "string", pkg)
+            .takeIf { it != 0 }
+            ?.let { runCatching { res.getString(it) }.getOrNull() }
+        if (declared != null && title.trim() == declared.trim()) return true
+
+        return title.contains(TARGET_UPDATE_KEYWORD)
+    }
+
+    /**
+     * 掐断 App 更新检查请求。
+     *
+     * `AppVersionAPIAtlasImpl.checkUpdate(AppVersionInfoListener)` 是更新检查唯一的网络出口，
+     * 构造 `MtopAtlasGetBaseUpdateListRequest`（带机型/城市/utdid/userId/cpuArch）后发出去。
+     * 全部 4 个调用方都汇聚到这里：
+     *   - `components.update.c.checkUpdate(Context)` / `c.a(Context, RemindType)`：常规自动检查
+     *   - `Initscheduler.initjob.j.aeT()`：启动 initjob
+     *   - `cubex.utils.ab.evalWithArgs`：DinamicX 模板里触发的检查
+     *
+     * 直接不执行 = App 永远不知道有新版本：不请求、不下载、不弹窗，也不再上传那份设备信息。
+     * 回调用的是混淆类 `components.event.d`，构造不出来，只能静默跳过；已实测上层不卡。
+     */
+    private fun hookAppUpdateCheck(classLoader: ClassLoader) {
+        runCatching {
+            val clazz = Class.forName(APP_VERSION_API_IMPL, false, classLoader)
+            val method = clazz.findMethod { it.name == "checkUpdate" && it.parameterCount == 1 } ?: run {
+                log(Log.WARN, TAG, "AppVersionAPIAtlasImpl.checkUpdate 未找到，更新检查拦截跳过")
+                return
+            }
+            hook(method).intercept {
+                log(Log.INFO, TAG, "拦截 App 更新检查请求")
+                null
+            }
+        }.onFailure { log(Log.ERROR, TAG, "hookAppUpdateCheck failed", it) }
+    }
+
+    /**
+     * 兜底：即使有未覆盖的路径把下载任务排进了队列，也不让它真的落盘。
+     *
+     * `ApkUpdateTask.run()` 只有一句 `eb(aiH())`：`aiH()` 用 downloadUrl 开
+     * HttpURLConnection 拉 129MB 的 apk，`eb()` 把结果回调给 listener。整段跳过，
+     * 但补一次 `downloadDone(false)`，让上层按「下载失败」收尾而不是停在「下载中」。
+     */
+    private fun hookApkDownloadTask(classLoader: ClassLoader) {
+        runCatching {
+            val clazz = Class.forName(APK_UPDATE_TASK, false, classLoader)
+            val method = clazz.findMethod { it.name == "run" && it.parameterCount == 0 } ?: run {
+                log(Log.WARN, TAG, "ApkUpdateTask.run 未找到，下载拦截跳过")
+                return
+            }
+            hook(method).intercept { chain ->
+                log(Log.INFO, TAG, "拦截 APK 下载任务，模拟下载失败")
+                runCatching { notifyDownloadFailed(chain.thisObject) }
+                    .onFailure { log(Log.ERROR, TAG, "notifyDownloadFailed failed", it) }
+                null
+            }
+        }.onFailure { log(Log.ERROR, TAG, "hookApkDownloadTask failed", it) }
+    }
+
+    /**
+     * 回调 `ApkUpdateTask.ApkDownloadListener.downloadDone(false)`。
+     * listener 字段名是混淆的，按「类型是 ApkDownloadListener」结构匹配。
+     */
+    private fun notifyDownloadFailed(task: Any) {
+        val listenerClass = Class.forName(APK_DOWNLOAD_LISTENER, false, task.javaClass.classLoader)
+        val field = task.javaClass.declaredFields.firstOrNull {
+            listenerClass.isAssignableFrom(it.type)
+        } ?: return
+        field.isAccessible = true
+        val listener = field.get(task) ?: return
+        listener.invokeMethod("downloadDone", false)
+    }
+
+    /**
+     * 删掉历史遗留的已下载安装包。
+     *
+     * 拦掉检查后不会再下新的，但升级前已经下载好的那份会一直躺在
+     * `<外部私有目录>/update/cainiao4android_tmp.apk`（实测 129MB）。
+     * 文件还在时弹窗逻辑依然会被触发，所以顺手清理。
+     */
+    private fun purgeDownloadedUpdatePackage(context: Context) {
+        runCatching {
+            val dir = context.getExternalFilesDir(UPDATE_APK_DIR) ?: return
+            val apk = File(dir, UPDATE_APK_NAME)
+            if (!apk.exists()) return
+            val size = apk.length()
+            if (apk.delete()) {
+                log(Log.INFO, TAG, "已删除残留更新包: ${apk.absolutePath} ($size bytes)")
+            } else {
+                log(Log.WARN, TAG, "残留更新包删除失败: ${apk.absolutePath}")
+            }
+        }.onFailure { log(Log.ERROR, TAG, "purgeDownloadedUpdatePackage failed", it) }
+    }
+
+    /**
      * "我的"页是 H5(page.cainiao.com/cn-app-web/profile)，向 WebView 注入清理脚本：
      * 移除"热门活动"卡片(标题文本锚点)和底部轮播推广横幅(热门活动后的最后一张白色圆角卡片)。
+     */
+    /**
+     * "我的"页是 H5(page.cainiao.com/cn-app-web/profile)，向 WebView 注入清理脚本：
+     * 移除"热门活动"卡片(标题文本锚点)和底部轮播推广横幅(热门活动后的最后一张白色圆角卡片)。
+     *
+     * 注入点分四路，覆盖 WindVane WebView 的各种加载方式与复用场景：
+     * `loadUrl` / `loadDataWithBaseURL`（导航发起）、`onPageStarted` / `onPageFinished`
+     * （document 已建立）、WebView 自身生命周期（复用到前台）、以及 `injectJsEarly`
+     * （随 UC document 创建阶段执行，最早期）。
      */
     private fun hookProfileH5Cleaner(classLoader: ClassLoader) {
         runCatching {
             val clazz = Class.forName("android.taobao.windvane.extra.uc.WVUCWebView", false, classLoader)
-            val method = clazz.findMethod { it.name == "loadUrl" && it.parameterCount == 1 && it.parameterTypes[0] == String::class.java }
-                ?: return
+
+            hookProfileLoadMethods(clazz)
+            hookProfileWebViewLifecycle(clazz)
+            hookProfilePageLifecycle(classLoader, clazz)
+
+            log(Log.INFO, TAG, "profile H5 cleaner hooks installed")
+        }.onFailure { log(Log.ERROR, TAG, "hookProfileH5Cleaner failed", it) }
+    }
+
+    /**
+     * WindVane 首次登录后可能使用 loadUrl(String, headers) 而非单参数重载。
+     * 所有首参数为 String 的 loadUrl 都挂上，导航返回后马上排一组前密后疏的注入。
+     */
+    private fun hookProfileLoadMethods(webViewClass: Class<*>) {
+        webViewClass.findAllMethods {
+            it.name == "loadUrl" &&
+                it.parameterCount >= 1 &&
+                it.parameterTypes[0] == String::class.java
+        }.forEach { method ->
+            hook(method).intercept { chain ->
+                val webView = chain.thisObject
+                val url = chain.getArg(0) as? String
+                updateProfileState(webView, url)
+                if (isProfileUrl(url)) {
+                    ensureProfileEarlyInjection(webView)
+                }
+                val result = chain.proceed()
+                if (isProfileUrl(url)) {
+                    scheduleProfileInjection(webView, PROFILE_LOAD_RETRY_DELAYS)
+                }
+                result
+            }
+        }
+
+        webViewClass.findAllMethods {
+            it.name == "loadDataWithBaseURL" &&
+                it.parameterCount >= 1 &&
+                it.parameterTypes[0] == String::class.java
+        }.forEach { method ->
+            hook(method).intercept { chain ->
+                val webView = chain.thisObject
+                val baseUrl = chain.getArg(0) as? String
+                updateProfileState(webView, baseUrl)
+                if (isProfileUrl(baseUrl)) {
+                    ensureProfileEarlyInjection(webView)
+                }
+                val result = chain.proceed()
+                if (isProfileUrl(baseUrl)) {
+                    scheduleProfileInjection(webView, PROFILE_LOAD_RETRY_DELAYS)
+                }
+                result
+            }
+        }
+    }
+
+    /**
+     * 复用/预加载 WebView 切到前台时再立即唤醒脚本，覆盖底栏切页没有重新 loadUrl 的情况。
+     * 只挂 WVUCWebView 自己覆写的方法，避免 Hook View 基类给全进程增加开销。
+     */
+    private fun hookProfileWebViewLifecycle(webViewClass: Class<*>) {
+        val lifecycleNames = setOf("onResume", "onAttachedToWindow", "coreOnVisibilityChanged")
+        webViewClass.declaredMethods
+            .filter { it.name in lifecycleNames }
+            .forEach { method ->
+                hook(method).intercept { chain ->
+                    val result = chain.proceed()
+                    val webView = chain.thisObject
+                    val becameVisible = method.name != "coreOnVisibilityChanged" ||
+                        chain.getArg(1) == View.VISIBLE
+                    if (becameVisible && isCurrentProfileWebView(webView)) {
+                        scheduleProfileInjection(webView, PROFILE_START_RETRY_DELAYS)
+                    }
+                    result
+                }
+            }
+    }
+
+    /**
+     * loadUrl 只能看到导航发起；onPageStarted 才是新 document 已建立的稳定注入点。
+     * onPageFinished 再做一次兜底，适配登录重定向和 WindVane WebView 复用。
+     */
+    private fun hookProfilePageLifecycle(classLoader: ClassLoader, webViewClass: Class<*>) {
+        val clientClass = Class.forName(
+            "android.taobao.windvane.extra.uc.WVUCWebViewClient",
+            false,
+            classLoader
+        )
+        clientClass.findAllMethods {
+            (it.name == "onPageStarted" || it.name == "onPageFinished") &&
+                it.parameterCount >= 2
+        }.forEach { method ->
             hook(method).intercept { chain ->
                 val result = chain.proceed()
-                val url = chain.getArg(0) as? String
-                if (url != null && url.contains("cn-app-web/profile")) {
-                    val webView = chain.thisObject
-                    val handler = Handler(Looper.getMainLooper())
-                    for (delay in longArrayOf(0L, 300L, 800L, 1500L, 3000L)) {
-                        handler.postDelayed({
-                            runCatching {
-                                webView.invokeEvaluateJs(PROFILE_CLEAN_JS)
-                            }.onFailure { log(Log.ERROR, TAG, "profile clean js failed", it) }
-                        }, delay)
+                var webView: Any? = null
+                var url: String? = null
+                for (index in 0 until method.parameterCount) {
+                    val arg = chain.getArg(index)
+                    if (webView == null && arg != null && webViewClass.isInstance(arg)) {
+                        webView = arg
+                    }
+                    if (url == null && arg is String) {
+                        url = arg
+                    }
+                }
+                if (webView != null) {
+                    updateProfileState(webView, url)
+                    if (isProfileUrl(url) || isCurrentProfileWebView(webView)) {
+                        ensureProfileEarlyInjection(webView)
+                        val delays = if (method.name == "onPageStarted") {
+                            PROFILE_START_RETRY_DELAYS
+                        } else {
+                            longArrayOf(0L)
+                        }
+                        scheduleProfileInjection(webView, delays)
                     }
                 }
                 result
             }
-        }.onFailure { log(Log.ERROR, TAG, "hookProfileH5Cleaner failed", it) }
+        }
+    }
+
+    private fun scheduleProfileInjection(webView: Any, delays: LongArray) {
+        for (delay in delays) {
+            PROFILE_HANDLER.postDelayed({
+                if (!isCurrentProfileWebView(webView)) return@postDelayed
+                runCatching {
+                    webView.invokeEvaluateJs(PROFILE_CLEAN_JS)
+                }.onFailure { log(Log.ERROR, TAG, "profile clean js failed", it) }
+            }, delay)
+        }
+    }
+
+    private fun updateProfileState(webView: Any, url: String?) {
+        if (url.isNullOrBlank() || url.startsWith("javascript:")) return
+        synchronized(profileWebViews) {
+            profileWebViews[webView] = isProfileUrl(url)
+        }
+    }
+
+    private fun isCurrentProfileWebView(webView: Any): Boolean {
+        val currentUrl = webView.invokeCurrentUrl()
+        if (!currentUrl.isNullOrBlank() && currentUrl != "about:blank") {
+            updateProfileState(webView, currentUrl)
+            return isProfileUrl(currentUrl)
+        }
+        return synchronized(profileWebViews) {
+            profileWebViews[webView] == true
+        }
+    }
+
+    private fun isProfileUrl(url: String?): Boolean =
+        url?.contains(PROFILE_URL_MARKER, ignoreCase = true) == true
+
+    private fun Any.invokeCurrentUrl(): String? {
+        return runCatching {
+            val method = getUrlMethods[javaClass] ?: (
+                javaClass.methods.firstOrNull {
+                    it.name == "getCurrentUrl" && it.parameterCount == 0
+                } ?: javaClass.methods.firstOrNull {
+                    it.name == "getUrl" && it.parameterCount == 0
+                }
+            )?.also { getUrlMethods[javaClass] = it } ?: return@runCatching null
+            method.invoke(this) as? String
+        }.getOrNull()
+    }
+
+    /**
+     * WVUCWebView 的真实早期注入入口，脚本会随 UC document 创建阶段执行。
+     * 该入口会累积脚本，所以同一个 WebView 只注册一次，后续页面通过 URL 判断是否执行。
+     */
+    private fun ensureProfileEarlyInjection(webView: Any) {
+        synchronized(earlyInjectedProfileWebViews) {
+            if (earlyInjectedProfileWebViews[webView] == true) return
+            earlyInjectedProfileWebViews[webView] = true
+        }
+        val success = runCatching {
+            val method = injectJsEarlyMethods[webView.javaClass] ?: webView.javaClass.methods.firstOrNull {
+                it.name == "injectJsEarly" &&
+                    it.parameterCount == 1 &&
+                    it.parameterTypes[0] == String::class.java
+            }?.also { injectJsEarlyMethods[webView.javaClass] = it } ?: return@runCatching false
+            method.isAccessible = true
+            method.invoke(webView, PROFILE_CLEAN_JS)
+            true
+        }.getOrElse {
+            log(Log.ERROR, TAG, "profile early JS injection failed", it)
+            false
+        }
+        if (!success) {
+            synchronized(earlyInjectedProfileWebViews) {
+                earlyInjectedProfileWebViews.remove(webView)
+            }
+        }
     }
 
     private fun Any.invokeEvaluateJs(js: String) {
-        val method = javaClass.methods.firstOrNull {
-            it.name == "evaluateJavascript" && it.parameterCount == 2 && it.parameterTypes[0] == String::class.java
-        } ?: return
-        method.isAccessible = true
-        method.invoke(this, js, null)
+        runCatching {
+            val method = evaluateJavascriptMethods[javaClass] ?: javaClass.methods.firstOrNull {
+                it.name == "evaluateJavascript" && it.parameterCount == 2 && it.parameterTypes[0] == String::class.java
+            }?.also { evaluateJavascriptMethods[javaClass] = it } ?: return@runCatching
+            method.isAccessible = true
+            method.invoke(this, js, null)
+        }.onFailure { log(Log.ERROR, TAG, "evaluateJavascript invoke failed", it) }
     }
 
     private fun hookGuideAdsSection(classLoader: ClassLoader) {
