@@ -8,9 +8,11 @@ import android.graphics.drawable.ColorDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.text.TextUtils
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewParent
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -20,6 +22,7 @@ import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
 import java.io.File
 import java.lang.reflect.Method
+import java.lang.reflect.Modifier
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 
@@ -30,6 +33,19 @@ class XposedInit : XposedModule() {
         const val TARGET_PACKAGE = "com.cainiao.wireless"
         const val HOME_PAGE_ACTIVITY = "com.cainiao.wireless.homepage.view.activity.HomePageActivity"
         const val TARGET_WUHUANWU = "物换物"
+
+        /** 首页「物换物」兜底扫描用的主线程 Handler（复用，别在每次焦点变化时新建）。 */
+        private val MAIN_HANDLER = Handler(Looper.getMainLooper())
+        private val WUHUANWU_SCAN_DELAYS = longArrayOf(3000L, 6000L)
+        private val wuhuanwuScanScheduled = WeakHashMap<View, Boolean>()
+
+        /** 首页 Activity 的 Class 缓存，供 onWindowFocusChanged 这种高频回调做常量时间比较。 */
+        @Volatile
+        private var homePageClass: Class<*>? = null
+
+        /** 残留升级包每个进程只清一次，避免 Activity 反复创建时重复主线程 IO。 */
+        @Volatile
+        private var updatePackagePurged = false
 
         /** 应用内升级提示弹窗（"更新安装包已经下载好"）。 */
         private const val TARGET_UPDATE_KEYWORD = "更新安装包"
@@ -149,6 +165,8 @@ class XposedInit : XposedModule() {
         hookLogisticNoticeProtocolView(classLoader)
         hookLogisticVipBannerView(classLoader)
         hookGuoJiangPop(classLoader)
+        hookHotGoodsRecommend(classLoader)
+        hookHomeBackgroundLottie(classLoader)
         hookUpdateInstallDialog(classLoader)
         hookAppUpdateCheck(classLoader)
         hookApkDownloadTask(classLoader)
@@ -413,10 +431,16 @@ class XposedInit : XposedModule() {
                 .forEach { method ->
                     hook(method).intercept { chain ->
                         val result = chain.proceed()
-                        val text = chain.getArg(0)?.toString()
-                        if (text != null && text.contains(TARGET_WUHUANWU)) {
+                        runCatching {
+                            val cs = chain.getArg(0) as? CharSequence ?: return@runCatching
+                            // 目标词只有 3 个字：短文本先挡掉，避免下面那次 String 分配。
+                            // TextView.setText 是全 App 最高频的调用之一（列表滚动、复用、刷新都走），
+                            // 原来的 `getArg(0)?.toString()` 会为每一次 setText 都创建一个 String。
+                            if (cs.length < TARGET_WUHUANWU.length) return@runCatching
+                            // TextUtils.indexOf 直接在 CharSequence 上匹配，不产生中间 String
+                            if (TextUtils.indexOf(cs, TARGET_WUHUANWU) < 0) return@runCatching
                             hideWuhuanwuEntry(chain.thisObject as View)
-                        }
+                        }.onFailure { log(Log.ERROR, TAG, "wuhuanwu text hide failed", it) }
                         result
                     }
                 }
@@ -463,7 +487,8 @@ class XposedInit : XposedModule() {
                 val result = chain.proceed()
                 val focused = chain.getArg(0) as? Boolean
                 val activity = chain.thisObject as? Activity
-                if (focused == true && activity != null && activity.javaClass.name == HOME_PAGE_ACTIVITY) {
+                // 用 Class 对象比较，避免每次焦点变化都取一次 class.name 字符串
+                if (focused == true && activity != null && isHomePageActivity(activity)) {
                     scheduleWuhuanwuScan(activity.window.decorView)
                 }
                 result
@@ -471,15 +496,30 @@ class XposedInit : XposedModule() {
         }.onFailure { log(Log.ERROR, TAG, "hookActivityFocusScanner failed", it) }
     }
 
+    /** 缓存首页 Activity 的 Class，避免高频回调上反复做字符串比较。 */
+    private fun isHomePageActivity(activity: Activity): Boolean {
+        val cached = homePageClass
+        if (cached != null && activity.javaClass == cached) return true
+        if (activity.javaClass.name != HOME_PAGE_ACTIVITY) return false
+        homePageClass = activity.javaClass
+        return true
+    }
+
     private fun scheduleWuhuanwuScan(rootView: View) {
-        if (rootView == null) return
-        val handler = Handler(Looper.getMainLooper())
-        for (delay in longArrayOf(3000L, 6000L)) {
-            handler.postDelayed({
+        // 前后台来回切会反复触发 focus，同一棵装饰树短时间内只排一次扫描。
+        synchronized(wuhuanwuScanScheduled) {
+            if (wuhuanwuScanScheduled[rootView] == true) return
+            wuhuanwuScanScheduled[rootView] = true
+        }
+        val delays = WUHUANWU_SCAN_DELAYS
+        for ((index, delay) in delays.withIndex()) {
+            MAIN_HANDLER.postDelayed({
                 runCatching {
-                    if (!rootView.isAttachedToWindow) return@runCatching
-                    hideWuhuanwuInTree(rootView, rootView)
+                    if (rootView.isAttachedToWindow) hideWuhuanwuInTree(rootView, rootView)
                 }.onFailure { log(Log.ERROR, TAG, "wuhuanwu scan failed", it) }
+                if (index == delays.lastIndex) {
+                    synchronized(wuhuanwuScanScheduled) { wuhuanwuScanScheduled.remove(rootView) }
+                }
             }, delay)
         }
     }
@@ -571,6 +611,8 @@ class XposedInit : XposedModule() {
                         this["id"] = "114514"
                         this["materialId"] = "114514"
                         this["pitId"] = "114514"
+                        // 点击行为整体去掉：清空 DinamicX 的 tapEvent，卡片不再注册点击。
+                        this["tapEvent"] = arrayListOf<Any>()
                         this["materialContentMapper"] = mapperClone
                         mapperClone.apply {
                             this["hasGroupHeader"] = ""
@@ -578,7 +620,10 @@ class XposedInit : XposedModule() {
                             this["title"] = "关于 FuckCainiao"
                             this["title_right"] = "版本 ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})"
                             this["type"] = "normal"
-                            this["jumpUrl"] = URL_ABOUT_FUCK_CAINIAO
+                            // 模板 guoguo_new_my_settings_item(v5) 直接读 mapper 的 jumpUrl 跳转，
+                            // 不看顶层 tapEvent。留空串让它判定为空、整行只渲染不响应点击。
+                            // hookAboutFuckCainiaoIntent 继续留着兜底。
+                            this["jumpUrl"] = ""
                         }
                     }
                     data.add(data.size - 1, aboutFuckCainiao)
@@ -593,12 +638,20 @@ class XposedInit : XposedModule() {
      * 拦截"关于 FuckCainiao"入口的跳转：点击后不跳转、不弹原作者的捐赠提示，
      * 让该按钮完全无响应。
      */
+    /**
+     * 兜底：万一「关于 FuckCainiao」的 jumpUrl 又被模板用上，也不让跳转。
+     * 主防线在注入条目时把 jumpUrl 置空（点击根本不派发跳转）。
+     *
+     * `Activity.startActivity` 是每次页面跳转都会走的高频路径，所以先按 Uri 的 scheme
+     * 做 O(1) 判断，只有 guoguo:// 的 Intent 才需要 toString 比对。
+     */
     private fun hookAboutFuckCainiaoIntent() {
         runCatching {
             val method = Activity::class.java.findMethod { it.name == "startActivity" && it.parameterCount == 2 } ?: return
             hook(method).intercept { chain ->
                 val intent = chain.getArg(0) as? Intent
-                if (intent?.dataString?.startsWith(URL_ABOUT_FUCK_CAINIAO) == true) {
+                val data = intent?.data
+                if (data != null && data.scheme == "guoguo" && data.toString().startsWith(URL_ABOUT_FUCK_CAINIAO)) {
                     Log.d(TAG, "拦截关于 FuckCainiao 跳转")
                     return@intercept null
                 }
@@ -676,6 +729,97 @@ class XposedInit : XposedModule() {
                 }
             }
         }.onFailure { log(Log.ERROR, TAG, "hookGuoJiangChainManager failed", it) }
+    }
+
+    /**
+     * 查件页（QueryPackageProActivity → MainPackageSearchFragment）的「今日好物推荐」商品标签网格。
+     *
+     * 8.11.727 的链路：
+     *  MainPackageSearchFragment.initViews()
+     *   → if (SearchHotGoodsApi.JL().JN())          // 读 OrangeConfig advertise/can_search_keyword_goods
+     *       initSearchHotGoodsView()
+     *         → mHomeRecommendHotGoodsView.setHotGoodsClickListener(...)
+     *         → SearchHotGoodsApi.JL().a(listener)   // 发起推荐请求
+     *
+     * 拦在开关处：JN() 只有 initViews 一个调用点，返回 false 后既不初始化也不发请求，
+     * 顺带把「搜索关键词商品」组件也一起挡掉（同一开关控制）。
+     * 兜底再把这个 View 整体 GONE，避免布局里残留标题和空网格。
+     */
+    private fun hookHotGoodsRecommend(classLoader: ClassLoader) {
+        runCatching {
+            val apiClazz = Class.forName("com.cainiao.wireless.ads.api.SearchHotGoodsApi", false, classLoader)
+            // JN() 在源码里是混淆名，按结构认：非静态 + 无参 + 返回 boolean，该类中唯一。
+            val candidates = apiClazz.declaredMethods.filter {
+                !Modifier.isStatic(it.modifiers) &&
+                    it.parameterCount == 0 &&
+                    it.returnType == java.lang.Boolean.TYPE
+            }
+            if (candidates.size != 1) {
+                log(Log.WARN, TAG, "SearchHotGoodsApi 开关方法候选数为 ${candidates.size}，跳过（无法消歧）")
+                return
+            }
+            hook(candidates[0]).intercept {
+                Log.d(TAG, "拦截查件页好物推荐开关")
+                false
+            }
+        }.onFailure { log(Log.ERROR, TAG, "hookHotGoodsRecommend(switch) failed", it) }
+
+        runCatching {
+            val viewClazz = Class.forName("com.cainiao.wireless.ads.widget.HomeRecommendHotGoodsView", false, classLoader)
+            val attached = viewClazz.findMethod { it.name == "onAttachedToWindow" && it.parameterCount == 0 }
+                ?: return@runCatching
+            hook(attached).intercept { chain ->
+                val result = chain.proceed()
+                runCatching { (chain.thisObject as? View)?.visibility = View.GONE }
+                    .onFailure { log(Log.ERROR, TAG, "hide HomeRecommendHotGoodsView failed", it) }
+                result
+            }
+        }.onFailure { log(Log.ERROR, TAG, "hookHotGoodsRecommend(view) failed", it) }
+    }
+
+    /**
+     * 首页背景层里的菜鸟 IP 形象动画（`CNGGLottieView`，bounds 0,436,1200,980）：
+     * header 下边界在 533，它只在金刚栏下方露出半个头，看着像活动 UI 的残留。
+     *
+     * 这个 View 是 initBackground 之后**异步 addView** 上来的，按时间点延迟隐藏会有窗口期
+     * （试过 6s 延迟，冷启动时先露好几秒）。改在 onAttachedToWindow 里判断：
+     * 祖先链上有 home_page_iv_bg 就直接 GONE —— 挂载时即生效，绘制前就没了，不会闪。
+     *
+     * 同层还有两个 ImageView（顶部蓝色渐变 + 中部背景），不在这个类上，不受影响。
+     */
+    private fun hookHomeBackgroundLottie(classLoader: ClassLoader) {
+        runCatching {
+            val clazz = Class.forName("com.cainiao.wireless.widget.view.CNGGLottieView", false, classLoader)
+            val method = clazz.findMethod { it.name == "onAttachedToWindow" && it.parameterCount == 0 } ?: run {
+                log(Log.WARN, TAG, "CNGGLottieView.onAttachedToWindow 未找到，首页 IP 动画层跳过")
+                return
+            }
+            hook(method).intercept { chain ->
+                val result = chain.proceed()
+                runCatching {
+                    val view = chain.thisObject as? View ?: return@runCatching
+                    if (isInHomeBackground(view)) {
+                        view.visibility = View.GONE
+                        Log.d(TAG, "挂载即隐藏首页 IP 动画层")
+                    }
+                }.onFailure { log(Log.ERROR, TAG, "hide home background lottie failed", it) }
+                result
+            }
+        }.onFailure { log(Log.ERROR, TAG, "hookHomeBackgroundLottie failed", it) }
+    }
+
+    /** 向上找 8 层，判断这个 View 是否挂在首页背景容器 home_page_iv_bg 下。 */
+    private fun isInHomeBackground(view: View): Boolean {
+        val targetId = view.resources.getIdentifier("home_page_iv_bg", "id", view.context.packageName)
+        if (targetId == 0) return false
+        var parent: ViewParent? = view.parent
+        var depth = 0
+        while (parent is View && depth < 8) {
+            if (parent.id == targetId) return true
+            parent = parent.parent
+            depth++
+        }
+        return false
     }
 
     /**
@@ -822,6 +966,9 @@ class XposedInit : XposedModule() {
      * 文件还在时弹窗逻辑依然会被触发，所以顺手清理。
      */
     private fun purgeDownloadedUpdatePackage(context: Context) {
+        // HomePageActivity 可能被反复创建，文件检查是主线程 IO，每个进程只做一次。
+        if (updatePackagePurged) return
+        updatePackagePurged = true
         runCatching {
             val dir = context.getExternalFilesDir(UPDATE_APK_DIR) ?: return
             val apk = File(dir, UPDATE_APK_NAME)
